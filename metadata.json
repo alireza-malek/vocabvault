@@ -1,0 +1,6 @@
+{
+  "name": "VocabVault",
+  "description": "Offline-first vocabulary learning assistant using spaced repetition (SRS), English-to-Farsi translations, dictionaries, exercises, and custom reminders.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

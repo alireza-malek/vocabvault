@@ -1,0 +1,8 @@
+--- SCANNING /tmp ---
+--- SCANNING /home ---
+--- SCANNING /root ---
+--- SCANNING /workspace ---
+--- SCANNING /app/applet ---
+greeting.png in /app/applet/app/src/test/screenshots (2868 bytes)
+--- SCANNING /app ---
+greeting.png in /app/applet/app/src/test/screenshots (2868 bytes)

@@ -1,0 +1,5 @@
+--- CALLING fetchAutoTranslation('statutory') ---
+RESULT: (Of, relating to, enacted or regulated by a statute., قانونی)
+
+--- CALLING fetchContextExamples('statutory') ---
+RESULT: [Speed limits apply at many points on the line, in addition to the general 25 m.p.h. limit over the whole Dromod-Belturbet section, but it is an open secret that speeds often rise above the statutory limit., The order is just one of several recent actions which have given statutory legitimacy to gay and lesbian couples. New York's highest court recently ruled that unmarried partners have the same rights as married ones under New York City rent control laws.]
