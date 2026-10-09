@@ -14,10 +14,13 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.Image
 import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -255,19 +258,13 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                 val sessionAnswers by viewModel.sessionAnswers.collectAsState()
                 val customExercises by viewModel.customExercises.collectAsState()
                 
-                // Missed session computation (warns only when more than 30 minutes past)
-                val missedExercise = remember(customExercises, words, ignoredSessions) {
-                    customExercises.filter { config ->
-                        val lastRun = viewModel.getLastRunTimestamp(config.id)
-                        val createdAt = viewModel.getConfigCreatedAt(config.id)
-                        val lastScheduled = viewModel.getLastScheduledTime(config)
-                        val isOverdue = lastRun < lastScheduled && lastScheduled <= System.currentTimeMillis() && lastScheduled > createdAt
-                        val isPassed30Mins = System.currentTimeMillis() - lastScheduled > 30 * 60 * 1000L
-                        val isIgnored = viewModel.isSessionIgnored(config.id, lastScheduled)
-                        isOverdue && isPassed30Mins && !isIgnored
-                    }.maxByOrNull { config ->
-                        viewModel.getLastScheduledTime(config)
-                    }
+                // Overdue sessions computation (gathers standard and recap overdue sessions in chronological order)
+                val overdueSessions = remember(customExercises, words, ignoredSessions) {
+                    viewModel.getOverdueSessions()
+                }
+                var selectedOverdueIndex by remember { mutableStateOf(0) }
+                if (selectedOverdueIndex >= overdueSessions.size && overdueSessions.isNotEmpty()) {
+                    selectedOverdueIndex = 0
                 }
                 
                 if (hasOngoing && activeWords.isNotEmpty()) {
@@ -347,13 +344,17 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                             }
                         }
                     }
-                } else if (missedExercise != null) {
+                } else if (overdueSessions.isNotEmpty()) {
+                    val currentOverdue = overdueSessions.getOrNull(selectedOverdueIndex) ?: overdueSessions.first()
                     // Missed session (Priority 2) - GLOWING ALWAYS with Relative time & Exact time
-                    val iconVector = if (missedExercise.type == "Learn") Icons.Default.AutoStories else Icons.Default.RateReview
+                    val iconVector = when {
+                        currentOverdue.isRecap -> Icons.Default.History
+                        currentOverdue.type == "Learn" -> Icons.Default.AutoStories
+                        else -> Icons.Default.RateReview
+                    }
                     
-                    val relativeMissedString = remember(missedExercise) {
-                        val lastScheduled = viewModel.getLastScheduledTime(missedExercise)
-                        val diffMs = System.currentTimeMillis() - lastScheduled
+                    val relativeMissedString = remember(currentOverdue) {
+                        val diffMs = System.currentTimeMillis() - currentOverdue.scheduledTime
                         if (diffMs <= 0L) {
                             "Missed just now"
                         } else {
@@ -366,10 +367,9 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                             }
                         }
                     }
-                    val exactMissedTimeText = remember(missedExercise) {
-                        val lastScheduled = viewModel.getLastScheduledTime(missedExercise)
+                    val exactMissedTimeText = remember(currentOverdue) {
                         val sdf = SimpleDateFormat("MMM d, HH:mm", Locale.getDefault())
-                        "Scheduled at ${sdf.format(Date(lastScheduled))}"
+                        "Scheduled at ${sdf.format(Date(currentOverdue.scheduledTime))}"
                     }
 
                     Card(
@@ -390,25 +390,86 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                         Column(modifier = Modifier.padding(16.dp)) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Icon(
-                                    imageVector = iconVector,
-                                    contentDescription = "Missed",
-                                    tint = Color(0xFF7C2D12),
-                                    modifier = Modifier.size(24.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    "Missed Schedule Warning!",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color(0xFF7C2D12)
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = iconVector,
+                                        contentDescription = "Missed",
+                                        tint = Color(0xFF7C2D12),
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        "Missed Schedule Warning!",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF7C2D12)
+                                    )
+                                }
+                                if (overdueSessions.size > 1) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        IconButton(
+                                            onClick = { if (selectedOverdueIndex > 0) selectedOverdueIndex-- },
+                                            enabled = selectedOverdueIndex > 0,
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.AutoMirrored.Filled.ArrowBack,
+                                                contentDescription = "Previous overdue session",
+                                                tint = if (selectedOverdueIndex > 0) Color(0xFF7C2D12) else Color(0xFF7C2D12).copy(alpha = 0.3f),
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                        Text(
+                                            text = "${selectedOverdueIndex + 1}/${overdueSessions.size}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF7C2D12)
+                                        )
+                                        IconButton(
+                                            onClick = { if (selectedOverdueIndex < overdueSessions.size - 1) selectedOverdueIndex++ },
+                                            enabled = selectedOverdueIndex < overdueSessions.size - 1,
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.AutoMirrored.Filled.ArrowForward,
+                                                contentDescription = "Next overdue session",
+                                                tint = if (selectedOverdueIndex < overdueSessions.size - 1) Color(0xFF7C2D12) else Color(0xFF7C2D12).copy(alpha = 0.3f),
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                    }
+                                }
                             }
+
+                            if (overdueSessions.size > 1) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    overdueSessions.forEachIndexed { idx, session ->
+                                        val isSel = idx == selectedOverdueIndex
+                                        FilterChip(
+                                            selected = isSel,
+                                            onClick = { selectedOverdueIndex = idx },
+                                            label = { Text("${idx + 1}. ${session.name}") },
+                                            leadingIcon = {
+                                                val chipIcon = if (session.isRecap) Icons.Default.History else if (session.type == "Learn") Icons.Default.AutoStories else Icons.Default.RateReview
+                                                Icon(chipIcon, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                "Missed: ${missedExercise.name} (${missedExercise.type})",
+                                "Missed: ${currentOverdue.name} (${currentOverdue.type})",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = Color(0xFF7C2D12)
@@ -428,7 +489,11 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                             Spacer(modifier = Modifier.height(14.dp))
                             Button(
                                 onClick = {
-                                    viewModel.startExerciseByConfig(missedExercise)
+                                    if (currentOverdue.isRecap) {
+                                        viewModel.startRecapSession(currentOverdue.config)
+                                    } else {
+                                        viewModel.startExerciseByConfig(currentOverdue.config)
+                                    }
                                     onNavigateToExercise()
                                 },
                                 modifier = Modifier
@@ -438,7 +503,7 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                             ) {
                                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Start Now", fontWeight = FontWeight.Bold)
+                                Text(if (currentOverdue.isRecap) "Start Recap Now" else "Start Now", fontWeight = FontWeight.Bold)
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Row(
@@ -459,7 +524,7 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                                     )
                                     Spacer(modifier = Modifier.width(5.dp))
                                     Text(
-                                        "Skip this missed session",
+                                        if (currentOverdue.isRecap) "Skip this missed recap" else "Skip this missed session",
                                         style = MaterialTheme.typography.bodySmall,
                                         fontWeight = FontWeight.Bold,
                                         color = Color(0xFF7C2D12).copy(alpha = 0.7f),
@@ -472,12 +537,15 @@ fun DashboardScreen(viewModel: VocabViewModel, onNavigateToExercise: () -> Unit)
                                 AlertDialog(
                                     onDismissRequest = { showSkipConfirmationDialog = false },
                                     title = { Text("Confirm Skip") },
-                                    text = { Text("Are you sure you want to skip this missed session?") },
+                                    text = { Text(if (currentOverdue.isRecap) "Are you sure you want to skip this missed recap session?" else "Are you sure you want to skip this missed session?") },
                                     confirmButton = {
                                         Button(
                                             onClick = {
-                                                val lastScheduled = viewModel.getLastScheduledTime(missedExercise)
-                                                viewModel.ignoreMissedSession(missedExercise.id, lastScheduled)
+                                                if (currentOverdue.isRecap) {
+                                                    viewModel.ignoreRecapSession(currentOverdue.config.id, currentOverdue.scheduledTime)
+                                                } else {
+                                                    viewModel.ignoreMissedSession(currentOverdue.config.id, currentOverdue.scheduledTime)
+                                                }
                                                 Toast.makeText(context, "Missed session ignored", Toast.LENGTH_SHORT).show()
                                                 showSkipConfirmationDialog = false
                                             },
@@ -1192,7 +1260,7 @@ fun SettingsDialog(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text("Version:", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("1.0.0", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                        Text("v1.1.0", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
                     }
                     Text(
                         "Copyright © 2026 Alireza",

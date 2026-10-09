@@ -7,6 +7,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -38,6 +40,13 @@ import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
+
+private data class ScopeOption(
+    val key: String,
+    val label: String,
+    val icon: androidx.compose.ui.graphics.vector.ImageVector,
+    val color: Color
+)
 
 private fun formatRelativeTime(targetTime: Long): String {
     val diffMs = targetTime - System.currentTimeMillis()
@@ -101,6 +110,7 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
     val isMeaningRevealed by viewModel.isMeaningRevealed.collectAsState()
     val sessionAnswers by viewModel.sessionAnswers.collectAsState()
     val customExercises by viewModel.customExercises.collectAsState()
+    val ignoredSessions by viewModel.ignoredSessions.collectAsState()
     val trailLogs by viewModel.trailLog.collectAsState()
     val hasOngoing by viewModel.hasOngoingSessionFlow.collectAsState()
     val activeSessionConfigId by viewModel.activeSessionConfigId.collectAsState()
@@ -179,16 +189,43 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                     )
                 }
 
-                val filteredConfigs = remember(customExercises, selectedTab) {
-                    customExercises.filter { 
+                val filteredConfigs = remember(customExercises, selectedTab, ignoredSessions) {
+                    val tabConfigs = customExercises.filter { 
                         if (selectedTab == 0) it.type == "Learn" else it.type == "Review" 
                     }
+                    tabConfigs.sortedWith(
+                        compareBy<ExerciseConfig> { config ->
+                            val lastRun = viewModel.getLastRunTimestamp(config.id)
+                            val createdAt = viewModel.getConfigCreatedAt(config.id)
+                            val lastScheduled = viewModel.getLastScheduledTime(config)
+                            val isOverdue = lastRun < lastScheduled && lastScheduled <= System.currentTimeMillis() && lastScheduled > createdAt
+                            val isPassed30Mins = System.currentTimeMillis() - lastScheduled > 30 * 60 * 1000L
+                            val isIgnored = viewModel.isSessionIgnored(config.id, lastScheduled)
+                            val isMissed = isOverdue && isPassed30Mins && !isIgnored
+                            
+                            val isRecapMissed = if (config.type == "Learn") viewModel.isRecapOverdueForConfig(config) else false
+
+                            val isActive = lastRun < lastScheduled && !isIgnored && System.currentTimeMillis() >= lastScheduled && (System.currentTimeMillis() - lastScheduled <= 30 * 60 * 1000L)
+                            val isRecapActive = if (config.type == "Learn") viewModel.isRecapActiveNowForConfig(config) else false
+
+                            when {
+                                isMissed || isRecapMissed -> 0
+                                isActive || isRecapActive -> 1
+                                else -> 2
+                            }
+                        }.thenBy { config ->
+                            val lastScheduled = viewModel.getLastScheduledTime(config)
+                            val lastRun = viewModel.getLastRunTimestamp(config.id)
+                            val isOverdue = lastScheduled <= System.currentTimeMillis()
+                            if (isOverdue) lastScheduled else viewModel.getNextScheduledTime(config, lastRun)
+                        }
+                    )
                 }
 
                 val filteredLogs = remember(trailLogs, selectedTab) {
                     trailLogs.filter { log ->
                         if (selectedTab == 0) {
-                            log.sessionType == "Learn" || log.sessionType == "Learning"
+                            log.sessionType == "Learn" || log.sessionType == "Learning" || log.sessionType == "Recap"
                         } else {
                             log.sessionType == "Review"
                         }
@@ -343,9 +380,30 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                     ) {
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(config.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
-                                            Text("Mode: ${config.mode} • Count: ${config.wordCount} words", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+                                            val daysAbbrMap = remember {
+                                                mapOf(1 to "Sun", 2 to "Mon", 3 to "Tue", 4 to "Wed", 5 to "Thu", 6 to "Fri", 7 to "Sat")
+                                            }
+                                            val modeSummary = if (config.mode == "Weekly") {
+                                                val daysNames = config.getEffectiveDaysOfWeek().mapNotNull { daysAbbrMap[it] }.joinToString(", ")
+                                                "Weekly ($daysNames)"
+                                            } else {
+                                                config.mode
+                                            }
+                                            Text("Mode: $modeSummary • Count: ${config.wordCount} words", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
                                             if (config.type == "Review") {
-                                                Text("Scope: ${config.reviewScope} • Algorithm: ${config.reviewAlgorithm}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                                val scopes = config.getEffectiveReviewScopes()
+                                                val scopeDisplay = if (scopes.size >= 3) {
+                                                    "All (Learnings, Fully learned, Troublesomes)"
+                                                } else {
+                                                    scopes.joinToString(", ") { s ->
+                                                        when (s) {
+                                                            "Learning" -> "Learnings"
+                                                            "Troublesome words" -> "Troublesomes"
+                                                            else -> s
+                                                        }
+                                                    }
+                                                }
+                                                Text("Scope: $scopeDisplay • Algorithm: ${config.reviewAlgorithm}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                                             }
                                             
                                             Spacer(modifier = Modifier.height(6.dp))
@@ -373,6 +431,8 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                                     if (recapLastRun < lastRun) {
                                                         val recapScheduledTime = lastRun + config.delayedRecapHours * 60 * 60 * 1000L
                                                         val isRecapDue = System.currentTimeMillis() >= recapScheduledTime
+                                                        val isRecapOverdue = viewModel.isRecapOverdueForConfig(config)
+                                                        val isRecapActiveNow = viewModel.isRecapActiveNowForConfig(config)
                                                         val recapRelative = if (isRecapDue) "Due now" else formatRelativeTime(recapScheduledTime)
                                                         val recapTimeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(recapScheduledTime))
                                                         Row(
@@ -380,8 +440,16 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                                             horizontalArrangement = Arrangement.spacedBy(4.dp),
                                                             modifier = Modifier.padding(top = 2.dp)
                                                         ) {
-                                                            Icon(Icons.Default.History, contentDescription = null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(16.dp))
-                                                            Text("Recap session: $recapTimeStr ($recapRelative)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                                                            if (isRecapOverdue) {
+                                                                Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
+                                                                Text("Missed recap session: ${formatRelativeDuration(System.currentTimeMillis() - recapScheduledTime)} ago", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
+                                                            } else if (isRecapActiveNow) {
+                                                                Icon(Icons.Default.Timer, contentDescription = null, tint = Color(0xFF2E7D32), modifier = Modifier.size(16.dp))
+                                                                Text("Recap session active now!", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+                                                            } else {
+                                                                Icon(Icons.Default.History, contentDescription = null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(16.dp))
+                                                                Text("Recap session: $recapTimeStr ($recapRelative)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -466,12 +534,45 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                                     .weight(1f)
                                                     .testTag("recap_exercise_button_${config.name.lowercase().replace(" ", "_")}"),
                                                 shape = RoundedCornerShape(8.dp),
-                                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = if (viewModel.isRecapOverdueForConfig(config)) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondary
+                                                )
                                             ) {
-                                                val recapLabel = if (isRecapUpcoming) "Start Recap Early" else "Start Recap"
-                                                Icon(Icons.Default.History, contentDescription = null)
+                                                val isRecapOverdue = viewModel.isRecapOverdueForConfig(config)
+                                                val recapLabel = if (isRecapOverdue) "Overdue Recap" else if (isRecapUpcoming) "Start Recap Early" else "Start Recap"
+                                                Icon(if (isRecapOverdue) Icons.Default.Warning else Icons.Default.History, contentDescription = null)
                                                 Spacer(modifier = Modifier.width(4.dp))
                                                 Text(recapLabel, fontWeight = FontWeight.Bold, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                                            }
+                                        }
+
+                                        val isRecapOverdue = viewModel.isRecapOverdueForConfig(config)
+                                        if (isMissed || isRecapOverdue) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                                horizontalArrangement = Arrangement.End
+                                            ) {
+                                                if (isMissed) {
+                                                    TextButton(
+                                                        onClick = {
+                                                            viewModel.ignoreMissedSession(config.id, lastScheduled)
+                                                            Toast.makeText(context, "Missed learn session ignored", Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    ) {
+                                                        Text("Skip missed learn", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                                                    }
+                                                }
+                                                if (isRecapOverdue) {
+                                                    TextButton(
+                                                        onClick = {
+                                                            val recapScheduledTime = lastRun + config.delayedRecapHours * 60 * 60 * 1000L
+                                                            viewModel.ignoreRecapSession(config.id, recapScheduledTime)
+                                                            Toast.makeText(context, "Missed recap ignored", Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    ) {
+                                                        Text("Skip missed recap", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                                                    }
+                                                }
                                             }
                                         }
                                     } else {
@@ -495,7 +596,8 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .testTag("start_exercise_button_${config.name.lowercase().replace(" ", "_")}"),
-                                            shape = RoundedCornerShape(8.dp)
+                                            shape = RoundedCornerShape(8.dp),
+                                            colors = if (isMissed) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error) else ButtonDefaults.buttonColors()
                                         ) {
                                             val defaultLabel = if (isMissed) {
                                                 "Start Overdue Session"
@@ -504,9 +606,24 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                             } else {
                                                 "Start Early"
                                             }
-                                            Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                            Icon(if (isMissed) Icons.Default.Warning else Icons.Default.PlayArrow, contentDescription = null)
                                             Spacer(modifier = Modifier.width(6.dp))
                                             Text(defaultLabel, fontWeight = FontWeight.Bold)
+                                        }
+                                        if (isMissed) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                                horizontalArrangement = Arrangement.End
+                                            ) {
+                                                TextButton(
+                                                    onClick = {
+                                                        viewModel.ignoreMissedSession(config.id, lastScheduled)
+                                                        Toast.makeText(context, "Missed session ignored", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                ) {
+                                                    Text("Skip missed session", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -565,7 +682,29 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                         horizontalArrangement = Arrangement.SpaceBetween
                                     ) {
                                         Column {
-                                            Text(dateString, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Text(dateString, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                                val (badgeText, badgeColor) = when (log.sessionType) {
+                                                    "Recap" -> "Recap" to MaterialTheme.colorScheme.tertiary
+                                                    "Review" -> "Review" to MaterialTheme.colorScheme.secondary
+                                                    else -> "Learning" to MaterialTheme.colorScheme.primary
+                                                }
+                                                Surface(
+                                                    shape = RoundedCornerShape(4.dp),
+                                                    color = badgeColor.copy(alpha = 0.15f)
+                                                ) {
+                                                    Text(
+                                                        text = badgeText,
+                                                        color = badgeColor,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                    )
+                                                }
+                                            }
                                             Spacer(modifier = Modifier.height(4.dp))
                                             Text(
                                                 text = "Score: ${log.passedCount} / ${log.totalWords} words",
@@ -1221,20 +1360,21 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
         var scheduleMinute by remember { mutableStateOf(configToEdit?.scheduleMinute?.toString() ?: "0") }
 
         // Weekly and Monthly dynamic fields
-        var dayOfWeek by remember { mutableStateOf(configToEdit?.dayOfWeek ?: java.util.Calendar.MONDAY) }
+        var selectedDaysOfWeek by remember {
+            mutableStateOf(configToEdit?.getEffectiveDaysOfWeek()?.toSet() ?: setOf(java.util.Calendar.MONDAY))
+        }
         var dayOfMonth by remember { mutableStateOf(configToEdit?.dayOfMonth ?: 1) }
 
-        // Review-specific options
-        var reviewScope by remember {
+        // Review-specific multi-select scope options
+        var selectedScopes by remember {
             mutableStateOf(
-                if (configToEdit?.reviewScope == "Only forgotten words") "Only Troublesome words"
-                else (configToEdit?.reviewScope ?: "All previous words")
+                configToEdit?.getEffectiveReviewScopes()?.toSet()
+                    ?: setOf("Learning", "Fully learned", "Troublesome words")
             )
         }
         var reviewAlgorithm by remember { mutableStateOf(configToEdit?.reviewAlgorithm ?: "Least practiced first") }
 
         var modeExpanded by remember { mutableStateOf(false) }
-        var scopeExpanded by remember { mutableStateOf(false) }
         var algorithmExpanded by remember { mutableStateOf(false) }
 
         val showTimePicker = {
@@ -1328,10 +1468,11 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                         }
                     }
 
-                    // WEEKLY Cyclic Circular day list selector
+                    // WEEKLY Multi-select Day list selector
                     if (mode == "Weekly") {
+                        val selectedDaysStr = daysList.filter { selectedDaysOfWeek.contains(it.first) }.joinToString(", ") { it.second }
                         Text(
-                            text = "Select Recurrence Day of Week:",
+                            text = "Select Recurrence Days of Week: ($selectedDaysStr)",
                             style = MaterialTheme.typography.titleSmall,
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Bold
@@ -1342,13 +1483,19 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             daysList.forEach { (calDay, desc) ->
-                                val isSel = dayOfWeek == calDay
+                                val isSel = selectedDaysOfWeek.contains(calDay)
                                 Box(
                                     modifier = Modifier
                                         .size(40.dp)
                                         .clip(CircleShape)
                                         .background(if (isSel) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant)
-                                        .clickable { dayOfWeek = calDay }
+                                        .clickable {
+                                            selectedDaysOfWeek = if (isSel) {
+                                                if (selectedDaysOfWeek.size > 1) selectedDaysOfWeek - calDay else selectedDaysOfWeek
+                                            } else {
+                                                selectedDaysOfWeek + calDay
+                                            }
+                                        }
                                         .border(1.dp, if (isSel) MaterialTheme.colorScheme.primary else Color.LightGray, CircleShape),
                                     contentAlignment = Alignment.Center
                                 ) {
@@ -1436,35 +1583,93 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                             )
                         }
                     } else {
-                        // REVIEW configurations: Scope & Flag sorting options
-                        Box(modifier = Modifier.fillMaxWidth()) {
-                            OutlinedTextField(
-                                value = reviewScope,
-                                onValueChange = {},
-                                readOnly = true,
-                                label = { Text("Review Word Selection Scope") },
-                                modifier = Modifier.fillMaxWidth(),
-                                trailingIcon = {
-                                    IconButton(onClick = { scopeExpanded = !scopeExpanded }) {
-                                        Icon(Icons.Default.ArrowDropDown, contentDescription = null)
-                                    }
-                                }
+                        // REVIEW configurations: Multi-select Scope & Algorithm options
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = "Review Scope:",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold
                             )
-                            DropdownMenu(
-                                expanded = scopeExpanded,
-                                onDismissRequest = { scopeExpanded = false }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            val isDark = isSystemInDarkTheme()
+                            val scopeChoices = remember(isDark) {
+                                listOf(
+                                    ScopeOption(
+                                        key = "Troublesome words",
+                                        label = "Troublesomes",
+                                        icon = Icons.Default.Warning,
+                                        color = if (isDark) Color(0xFFE57373) else Color(0xFFC62828)
+                                    ),
+                                    ScopeOption(
+                                        key = "Learning",
+                                        label = "Learnings",
+                                        icon = Icons.Default.AutoStories,
+                                        color = if (isDark) Color(0xFF64B5F6) else Color(0xFF1976D2)
+                                    ),
+                                    ScopeOption(
+                                        key = "Fully learned",
+                                        label = "Fully learned",
+                                        icon = Icons.Default.Stars,
+                                        color = if (isDark) Color(0xFF81C784) else Color(0xFF2E7D32)
+                                    )
+                                )
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                                    .padding(vertical = 2.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                listOf("All previous words", "Only Troublesome words").forEach { opt ->
-                                    DropdownMenuItem(
-                                        text = { Text(opt) },
+                                scopeChoices.forEach { scope ->
+                                    val isSelected = selectedScopes.contains(scope.key)
+                                    FilterChip(
+                                        selected = isSelected,
                                         onClick = {
-                                            reviewScope = opt
-                                            scopeExpanded = false
-                                        }
+                                            selectedScopes = if (isSelected) {
+                                                if (selectedScopes.size > 1) selectedScopes - scope.key else selectedScopes
+                                            } else {
+                                                selectedScopes + scope.key
+                                            }
+                                        },
+                                        label = {
+                                            Text(
+                                                text = scope.label,
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = scope.icon,
+                                                contentDescription = null,
+                                                tint = if (isSelected) scope.color else scope.color.copy(alpha = 0.55f),
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = scope.color.copy(alpha = 0.14f),
+                                            selectedLabelColor = MaterialTheme.colorScheme.onSurface,
+                                            selectedLeadingIconColor = scope.color,
+                                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                            labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+                                        ),
+                                        border = FilterChipDefaults.filterChipBorder(
+                                            enabled = true,
+                                            selected = isSelected,
+                                            borderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                                            selectedBorderColor = scope.color.copy(alpha = 0.55f),
+                                            borderWidth = if (isSelected) 1.5.dp else 1.dp
+                                        ),
+                                        shape = RoundedCornerShape(10.dp)
                                     )
                                 }
                             }
                         }
+
+                        Spacer(modifier = Modifier.height(4.dp))
 
                         // Review Algorithm Dropdown
                         Box(modifier = Modifier.fillMaxWidth()) {
@@ -1524,7 +1729,7 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
 
                                 val newConfig = ExerciseConfig(
                                     id = configToEdit?.id ?: UUID.randomUUID().toString(),
-                                    name = name,
+                                    name = name.trim(),
                                     type = if (selectedTab == 0) "Learn" else "Review",
                                     mode = mode,
                                     wordCount = cnt,
@@ -1533,9 +1738,11 @@ fun ExerciseScreen(viewModel: VocabViewModel) {
                                     notificationEnabled = notificationEnabled,
                                     scheduleHour = h,
                                     scheduleMinute = m,
-                                    dayOfWeek = dayOfWeek,
+                                    dayOfWeek = selectedDaysOfWeek.firstOrNull() ?: java.util.Calendar.MONDAY,
+                                    daysOfWeek = selectedDaysOfWeek.sorted(),
                                     dayOfMonth = dayOfMonth,
-                                    reviewScope = reviewScope,
+                                    reviewScope = if (selectedScopes.size >= 3) "All previous words" else selectedScopes.joinToString(", "),
+                                    reviewScopes = selectedScopes.toList(),
                                     sortByLastFlagged = false,
                                     reviewAlgorithm = reviewAlgorithm
                                 )

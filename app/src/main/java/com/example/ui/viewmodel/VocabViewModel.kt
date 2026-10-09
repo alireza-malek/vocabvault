@@ -9,6 +9,7 @@ import com.example.data.model.ReviewMark
 import com.example.data.model.Word
 import com.example.data.model.ExerciseConfig
 import com.example.data.model.OngoingSessionState
+import com.example.data.model.OverdueSessionItem
 import com.example.data.repository.WordRepository
 import com.example.util.NotificationScheduler
 import com.squareup.moshi.Moshi
@@ -184,6 +185,7 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
             "Forgotten Marks" -> list.sortedByDescending { it.forgottenCount }
             "Date Practiced" -> list.sortedByDescending { it.reviewHistory.lastOrNull()?.timestamp ?: 0L }
             "Custom Order" -> list.sortedBy { it.customOrder }
+            "Random" -> list.shuffled(java.security.SecureRandom())
             else -> list.sortedBy { it.dateAdded }
         }
     }
@@ -642,16 +644,18 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 "Review" -> {
                     val hasHistory = words.filter { it.reviewHistory.isNotEmpty() }
+                    val effectiveScopes = config.getEffectiveReviewScopes()
+                    val scoped = hasHistory.filter { it.masteryLevel in effectiveScopes }
                     
-                    val scoped = if (config.reviewScope == "Only Troublesome words" || config.reviewScope == "Only forgotten words") {
-                        words.filter { it.masteryLevel == "Troublesome words" }
-                    } else {
-                        hasHistory
-                    }
+                    val rng = java.security.SecureRandom()
+                    val isRandom = config.reviewAlgorithm.trim().equals("Random", ignoreCase = true) ||
+                                   config.reviewAlgorithm.contains("random", ignoreCase = true)
+                    val isLeastPracticed = config.reviewAlgorithm.trim().equals("Least practiced first", ignoreCase = true) ||
+                                           config.reviewAlgorithm.contains("least", ignoreCase = true)
                     
-                    when (config.reviewAlgorithm) {
-                        "Random" -> scoped.shuffled().take(config.wordCount)
-                        "Least practiced first" -> scoped.sortedBy { it.totalReviews }.take(config.wordCount)
+                    when {
+                        isRandom -> scoped.shuffled(rng).take(config.wordCount)
+                        isLeastPracticed -> scoped.shuffled(rng).sortedBy { it.totalReviews }.take(config.wordCount)
                         else -> sortWords(scoped, sortBy.value).take(config.wordCount) // "In order" / "In order (Dictionary sort)"
                     }
                 }
@@ -689,10 +693,10 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val finalBatch = if (selectedBatch.isNotEmpty()) {
-                selectedBatch
+                selectedBatch.shuffled(java.security.SecureRandom())
             } else {
                 val wordsSorted = allWords.value.filter { it.reviewHistory.isNotEmpty() }
-                    .sortedByDescending { it.reviewHistory.lastOrNull()?.timestamp ?: 0L }
+                    .shuffled(java.security.SecureRandom())
                 wordsSorted.take(config.wordCount)
             }
 
@@ -722,8 +726,112 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
         return System.currentTimeMillis() < recapScheduledTime
     }
 
+    fun getRecapScheduledTime(config: ExerciseConfig): Long {
+        val lastRun = getLastRunTimestamp(config.id)
+        return if (lastRun > 1L) lastRun + config.delayedRecapHours * 60 * 60 * 1000L else 0L
+    }
+
+    fun isRecapOverdueForConfig(config: ExerciseConfig): Boolean {
+        if (config.type != "Learn" || !config.delayedRecapEnabled) return false
+        val lastRun = getLastRunTimestamp(config.id)
+        if (lastRun <= 1L) return false
+        val recapLastRun = getRecapLastRun(config.id)
+        if (recapLastRun >= lastRun) return false
+        val recapScheduledTime = lastRun + config.delayedRecapHours * 60 * 60 * 1000L
+        val isPassed30Mins = System.currentTimeMillis() - recapScheduledTime > 30 * 60 * 1000L
+        val isIgnored = isRecapSessionIgnored(config.id, recapScheduledTime)
+        return isPassed30Mins && !isIgnored
+    }
+
+    fun isRecapActiveNowForConfig(config: ExerciseConfig): Boolean {
+        if (config.type != "Learn" || !config.delayedRecapEnabled) return false
+        val lastRun = getLastRunTimestamp(config.id)
+        if (lastRun <= 1L) return false
+        val recapLastRun = getRecapLastRun(config.id)
+        if (recapLastRun >= lastRun) return false
+        val recapScheduledTime = lastRun + config.delayedRecapHours * 60 * 60 * 1000L
+        val diff = System.currentTimeMillis() - recapScheduledTime
+        val isIgnored = isRecapSessionIgnored(config.id, recapScheduledTime)
+        return diff >= 0L && diff <= 30 * 60 * 1000L && !isIgnored
+    }
+
     fun getRecapLastRun(configId: String): Long {
         return sharedPrefs.getLong("recap_last_run_$configId", 0L)
+    }
+
+    fun ignoreRecapSession(configId: String, scheduledTime: Long) {
+        val key = "recap_${configId}_$scheduledTime"
+        ignoredSessions.value = ignoredSessions.value + key
+        sharedPrefs.edit()
+            .putLong("ignored_recap_${configId}_${scheduledTime}", scheduledTime)
+            .putLong("recap_last_run_$configId", System.currentTimeMillis())
+            .apply()
+        calculateCountdown()
+    }
+
+    fun isRecapSessionIgnored(configId: String, scheduledTime: Long): Boolean {
+        val key = "recap_${configId}_$scheduledTime"
+        if (ignoredSessions.value.contains(key)) return true
+        val persisted = sharedPrefs.getLong("ignored_recap_${configId}_${scheduledTime}", 0L) == scheduledTime
+        if (persisted) {
+            ignoredSessions.value = ignoredSessions.value + key
+            return true
+        }
+        return false
+    }
+
+    fun getOverdueSessions(): List<OverdueSessionItem> {
+        val list = mutableListOf<OverdueSessionItem>()
+        val configs = customExercises.value
+        val now = System.currentTimeMillis()
+
+        for (config in configs) {
+            val lastRun = getLastRunTimestamp(config.id)
+            val createdAt = getConfigCreatedAt(config.id)
+            val lastScheduled = getLastScheduledTime(config)
+            val isOverdue = lastRun < lastScheduled && lastScheduled <= now && lastScheduled > createdAt
+            val isPassed30Mins = now - lastScheduled > 30 * 60 * 1000L
+            val isIgnored = isSessionIgnored(config.id, lastScheduled)
+            if (isOverdue && isPassed30Mins && !isIgnored) {
+                list.add(
+                    OverdueSessionItem(
+                        sessionKey = "std_${config.id}_$lastScheduled",
+                        config = config,
+                        isRecap = false,
+                        scheduledTime = lastScheduled,
+                        name = config.name,
+                        type = config.type
+                    )
+                )
+            }
+
+            if (config.type == "Learn" && config.delayedRecapEnabled) {
+                if (lastRun > 1L) {
+                    val recapLastRun = getRecapLastRun(config.id)
+                    if (recapLastRun < lastRun) {
+                        val recapScheduledTime = lastRun + config.delayedRecapHours * 60 * 60 * 1000L
+                        val isRecapDue = now >= recapScheduledTime
+                        val isRecapPassed30Mins = now - recapScheduledTime > 30 * 60 * 1000L
+                        val isRecapIgnored = isRecapSessionIgnored(config.id, recapScheduledTime)
+                        if (isRecapDue && isRecapPassed30Mins && !isRecapIgnored) {
+                            list.add(
+                                OverdueSessionItem(
+                                    sessionKey = "recap_${config.id}_$recapScheduledTime",
+                                    config = config,
+                                    isRecap = true,
+                                    scheduledTime = recapScheduledTime,
+                                    name = "${config.name} Recap",
+                                    type = "Recap"
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Return strictly in chronological order (earliest overdue first)
+        return list.sortedBy { it.scheduledTime }
     }
 
     fun startSession(sessionType: String) {
@@ -950,10 +1058,20 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             "Weekly" -> {
-                calendar.set(Calendar.DAY_OF_WEEK, config.dayOfWeek)
-                if (calendar.timeInMillis > System.currentTimeMillis()) {
-                    calendar.add(Calendar.WEEK_OF_YEAR, -1)
+                val targetDays = config.getEffectiveDaysOfWeek()
+                val lastTimes = targetDays.map { targetDay ->
+                    val cal = Calendar.getInstance().apply {
+                        set(Calendar.HOUR_OF_DAY, config.scheduleHour)
+                        set(Calendar.MINUTE, config.scheduleMinute)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    while (cal.timeInMillis > System.currentTimeMillis() || cal.get(Calendar.DAY_OF_WEEK) != targetDay) {
+                        cal.add(Calendar.DAY_OF_YEAR, -1)
+                    }
+                    cal.timeInMillis
                 }
+                return lastTimes.maxOrNull() ?: calendar.timeInMillis
             }
             "Monthly" -> {
                 val targetDay = config.dayOfMonth
@@ -1008,8 +1126,10 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
                     cal1.get(Calendar.DAY_OF_YEAR) == calendar.get(Calendar.DAY_OF_YEAR)
                 }
                 "Weekly" -> {
+                    val targetDays = config.getEffectiveDaysOfWeek()
                     cal1.get(Calendar.YEAR) == calendar.get(Calendar.YEAR) &&
-                    cal1.get(Calendar.WEEK_OF_YEAR) == calendar.get(Calendar.WEEK_OF_YEAR)
+                    cal1.get(Calendar.DAY_OF_YEAR) == calendar.get(Calendar.DAY_OF_YEAR) &&
+                    cal1.get(Calendar.DAY_OF_WEEK) in targetDays
                 }
                 "Monthly" -> {
                     cal1.get(Calendar.YEAR) == calendar.get(Calendar.YEAR) &&
@@ -1029,13 +1149,27 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             "Weekly" -> {
-                calendar.set(Calendar.DAY_OF_WEEK, config.dayOfWeek)
-                if (isSamePeriodAsScheduled(lastRunTimestamp)) {
-                    calendar.add(Calendar.WEEK_OF_YEAR, 1)
+                val targetDays = config.getEffectiveDaysOfWeek()
+                val nextTimes = targetDays.map { targetDay ->
+                    val cal = Calendar.getInstance().apply {
+                        timeInMillis = baseTime
+                        set(Calendar.HOUR_OF_DAY, config.scheduleHour)
+                        set(Calendar.MINUTE, config.scheduleMinute)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    val lastCal = if (lastRunTimestamp > 1L) Calendar.getInstance().apply { timeInMillis = lastRunTimestamp } else null
+                    fun ranOnSameDay(c: Calendar): Boolean {
+                        if (lastCal == null) return false
+                        return lastCal.get(Calendar.YEAR) == c.get(Calendar.YEAR) &&
+                               lastCal.get(Calendar.DAY_OF_YEAR) == c.get(Calendar.DAY_OF_YEAR)
+                    }
+                    while (cal.timeInMillis <= baseTime || cal.get(Calendar.DAY_OF_WEEK) != targetDay || ranOnSameDay(cal)) {
+                        cal.add(Calendar.DAY_OF_YEAR, 1)
+                    }
+                    cal.timeInMillis
                 }
-                while (calendar.timeInMillis <= baseTime) {
-                    calendar.add(Calendar.WEEK_OF_YEAR, 1)
-                }
+                return nextTimes.minOrNull() ?: calendar.timeInMillis
             }
             "Monthly" -> {
                 val targetDay = config.dayOfMonth
@@ -1063,6 +1197,7 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val now = System.currentTimeMillis()
         var closestTime = Long.MAX_VALUE
         var closestConfig: ExerciseConfig? = null
         var nextIsRecap = false
@@ -1076,10 +1211,15 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
                     val recapLastRun = sharedPrefs.getLong("recap_last_run_${config.id}", 0L)
                     if (recapLastRun < lastRun) {
                         val recapScheduledTime = lastRun + config.delayedRecapHours * 60 * 60 * 1000L
-                        if (recapScheduledTime < closestTime) {
-                            closestTime = recapScheduledTime
-                            closestConfig = config
-                            nextIsRecap = true
+                        val isRecapIgnored = isRecapSessionIgnored(config.id, recapScheduledTime)
+                        val isOverdueRecap = now - recapScheduledTime > 30 * 60 * 1000L
+                        // Only consider in countdown if not ignored and not overdue (>30 mins past)
+                        if (!isRecapIgnored && !isOverdueRecap) {
+                            if (recapScheduledTime < closestTime) {
+                                closestTime = recapScheduledTime
+                                closestConfig = config
+                                nextIsRecap = true
+                            }
                         }
                     }
                 }
@@ -1089,8 +1229,8 @@ class VocabViewModel(application: Application) : AndroidViewModel(application) {
             val lastScheduled = getLastScheduledTime(config)
             val isActiveNow = lastRun < lastScheduled && 
                     !isSessionIgnored(config.id, lastScheduled) && 
-                    System.currentTimeMillis() >= lastScheduled && 
-                    (System.currentTimeMillis() - lastScheduled <= 30 * 60 * 1000L)
+                    now >= lastScheduled && 
+                    (now - lastScheduled <= 30 * 60 * 1000L)
             
             val targetTimeForThis = if (isActiveNow) {
                 lastScheduled
